@@ -1,0 +1,507 @@
+#!/bin/sh
+#
+# spi - Safe Plugin Injector (Unixity Plex / Uniplexity)
+# Neon Hacker Edition (ANSI green vibes)
+#
+# POSIX /bin/sh compatible
+
+PROGNAME="spi"
+VERSION="1.0.0"
+TAGLINE="SPI — a Unixity Plex project (Uniplexity)"
+
+# Defaults
+verbose=0
+silent=0
+auto=0
+safe=0
+nolimit=0
+position=""
+payload=""
+payload_file=""
+host=""
+mode=""
+backup=0
+dryrun=0
+logfile=""
+clean=0
+show_signatures=0
+show_about=0
+
+# Threshold for size check (1MB default)
+MAX_PAYLOAD_BYTES=1000000
+
+# ANSI neon (green) style (only if terminal and not silent)
+_color_enable=0
+if [ -t 1 ]; then
+    _color_enable=1
+fi
+
+cecho() {
+    if [ "$silent" -eq 1 ]; then
+        return
+    fi
+    if [ "$_color_enable" -eq 1 ]; then
+        printf "\033[1;32m%s\033[0m\n" "$1"
+    else
+        printf "%s\n" "$1"
+    fi
+}
+
+cerr() {
+    if [ "$silent" -eq 1 ]; then
+        return
+    fi
+    if [ "$_color_enable" -eq 1 ]; then
+        printf "\033[1;31m%s\033[0m\n" "$1" >&2
+    else
+        printf "%s\n" "$1" >&2
+    fi
+}
+
+log_write() {
+    if [ -n "$logfile" ]; then
+        printf "%s\n" "$1" >> "$logfile" 2>/dev/null
+    fi
+}
+
+usage() {
+    cat <<EOF
+===========================================
+   ███████╗██████╗ ██╗
+   ██╔════╝██╔══██╗██║
+   ███████╗██████╔╝██║   Safe Plugin Injector
+   ╚════██║██╔══██╗██║   (SPI) — Unixity Plex Project
+   ███████║██║  ██║██║
+   ╚══════╝╚═╝  ╚═╝╚═╝   v$VERSION
+===========================================
+Neon Hacker Edition — Uniplexity
+
+Usage:
+  spi [options] [payload|string] [host file]
+
+Options:
+  -v, --verbose         Verbose output (show actions)
+  -q, --silent          Quiet mode (no output)
+  -a, --auto            Auto-select injection position (language-aware)
+  -s, --safe            Scan payload for malware signatures
+  -p, --position POS    Injection position (top, after_imports, middle, bottom)
+  -f, --file FILE       Use a file as the payload
+  -nl, --no-limitation  Disable payload size limit
+  -m, --mode LANG       Language mode (python, c, cpp, sh, csharp)
+  -b, --backup          Create a backup file before modifying host (.bak)
+  -dr, --dry-run        Show what would be done without modifying files
+  --log FILE            Append actions to FILE
+  --clean               Remove .bak backups in host directory
+  --signatures          Print the malware signatures used by --safe
+  --about               Show about banner and credits
+  --help                Show this help
+
+Examples:
+  spi -v "print('hi')" main.py
+  spi -f payload.txt -m python -p after_imports target.py
+  spi -a -s -b -dr -m c payload.c target.c
+EOF
+    exit 0
+}
+
+about() {
+    cat <<EOF
+===========================================
+$PROGNAME v$VERSION
+$TAGLINE
+
+A neon-styled safe payload injector.
+Project: Unixity Plex / Uniplexity
+Features:
+ - Language-aware insertion (python, c, cpp, sh, csharp)
+ - Safe-mode malware signature scanning
+ - Payload file support, dry-run, backups, logging
+ - Auto-detection of host filetype
+ - Neon CLI style (green)
+===========================================
+EOF
+    exit 0
+}
+
+signatures_list() {
+    cat <<EOF
+Known (demo) malware signatures:
+ - rm -rf /
+ - chmod 777
+ - wget evil
+ - curl bad
+ - eval(base64_decode
+ - powershell -EncodedCommand
+These are simple string checks; extend as desired.
+EOF
+    exit 0
+}
+
+# Simple logger for verbose mode
+vlog() {
+    if [ "$verbose" -eq 1 ] && [ "$silent" -ne 1 ]; then
+        cecho "[+] $*"
+    fi
+    log_write "[`date`] $*"
+}
+
+# Error and exit
+die() {
+    cerr "[!] $*"
+    log_write "[`date`] ERROR: $*"
+    exit 1
+}
+
+# POSIX-safe mktemp fallback
+tmpfile() {
+    if command -v mktemp >/dev/null 2>&1; then
+        mktemp
+    else
+        tf="/tmp/${PROGNAME}.$$.$RANDOM"
+        printf "%s" "$tf"
+    fi
+}
+
+# Auto-detect mode from host extension if mode not given
+auto_detect_mode() {
+    file="$1"
+    case "$file" in
+        *.py) echo "python";;
+        *.sh) echo "sh";;
+        *.c) echo "c";;
+        *.cc|*.cpp|*.cxx|*.hpp|*.h) echo "cpp";;
+        *.cs) echo "csharp";;
+        *) echo "";;
+    esac
+}
+
+# Malware detection (string matching)
+detect_malware_in_string() {
+    content="$1"
+    # Demo list - add your own patterns here
+    case "$content" in
+        *"rm -rf /"*|*"chmod 777"*|*"wget evil"*|*"curl bad"*|*"eval(base64_decode"*|*"powershell -EncodedCommand"* )
+            return 0;;
+    esac
+    return 1
+}
+
+detect_malware_in_file() {
+    file="$1"
+    # scan by grepping known patterns
+    if grep -E -q "rm -rf /|chmod 777|wget evil|curl bad|eval\(base64_decode|powershell -EncodedCommand" "$file" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Create backup
+create_backup() {
+    f="$1"
+    bak="${f}.bak"
+    if [ -f "$bak" ]; then
+        vlog "Backup already exists: $bak"
+    else
+        cp "$f" "$bak" || die "Failed to create backup"
+        vlog "Backup created: $bak"
+    fi
+}
+
+# Cleanup backups in host directory
+do_clean() {
+    dir="$(dirname "$host")"
+    vlog "Cleaning .bak files in $dir"
+    find "$dir" -maxdepth 1 -type f -name "*.bak" -print -exec rm -f {} \; 2>/dev/null || :
+    cecho "[+] Cleanup complete."
+    exit 0
+}
+
+# Insert payload (payload may be string or file)
+# For file payload, payload_file != ""
+inject_to_top() {
+    target="$1"
+    if [ -n "$payload_file" ]; then
+        tmp="$(tmpfile)"
+        cat "$payload_file" > "$tmp" || die "Failed to read payload file"
+        cat "$target" >> "$tmp"
+        preview_or_commit "$tmp" "$target"
+    else
+        tmp="$(tmpfile)"
+        printf "%s\n" "$payload" > "$tmp"
+        cat "$target" >> "$tmp"
+        preview_or_commit "$tmp" "$target"
+    fi
+}
+
+inject_to_bottom() {
+    target="$1"
+    if [ -n "$payload_file" ]; then
+        tmp="$(tmpfile)"
+        cat "$target" > "$tmp"
+        cat "$payload_file" >> "$tmp"
+        preview_or_commit "$tmp" "$target"
+    else
+        tmp="$(tmpfile)"
+        cat "$target" > "$tmp"
+        printf "%s\n" "$payload" >> "$tmp"
+        preview_or_commit "$tmp" "$target"
+    fi
+}
+
+inject_to_middle() {
+    target="$1"
+    lines=$(wc -l < "$target" 2>/dev/null)
+    if [ -z "$lines" ] || [ "$lines" -eq 0 ]; then
+        inject_to_bottom "$target"
+        return
+    fi
+    half=$((lines / 2))
+    tmp="$(tmpfile)"
+    head -n "$half" "$target" > "$tmp"
+    if [ -n "$payload_file" ]; then
+        cat "$payload_file" >> "$tmp"
+    else
+        printf "%s\n" "$payload" >> "$tmp"
+    fi
+    tail -n +"$((half + 1))" "$target" >> "$tmp"
+    preview_or_commit "$tmp" "$target"
+}
+
+inject_after_imports() {
+    target="$1"
+    tmp="$(tmpfile)"
+    inserted=0
+
+    # Read through target; insert after last import-like line based on mode
+    # For performance with large files we stream line-by-line
+    exec 3<"$target"
+    while IFS= read -r line <&3; do
+        printf "%s\n" "$line" >> "$tmp"
+        if [ "$inserted" -eq 0 ]; then
+            case "$mode" in
+                python)
+                    case "$line" in
+                        import*|from* ) ;; # still in imports
+                        *)
+                            # insert once the current line is not an import
+                            if [ -n "$payload_file" ]; then
+                                cat "$payload_file" >> "$tmp"
+                            else
+                                printf "%s\n" "$payload" >> "$tmp"
+                            fi
+                            inserted=1
+                        ;;
+                    esac
+                ;;
+                sh)
+                    case "$line" in
+                        '#!'*) ;; # skip shebang
+                        *)
+                            if [ -n "$payload_file" ]; then
+                                cat "$payload_file" >> "$tmp"
+                            else
+                                printf "%s\n" "$payload" >> "$tmp"
+                            fi
+                            inserted=1
+                        ;;
+                    esac
+                ;;
+                c|cpp)
+                    case "$line" in
+                        '#include'* ) ;; # keep skipping includes
+                        *)
+                            if [ -n "$payload_file" ]; then
+                                cat "$payload_file" >> "$tmp"
+                            else
+                                printf "%s\n" "$payload" >> "$tmp"
+                            fi
+                            inserted=1
+                        ;;
+                    esac
+                ;;
+                csharp)
+                    case "$line" in
+                        using* ) ;; # skip using lines
+                        *)
+                            if [ -n "$payload_file" ]; then
+                                cat "$payload_file" >> "$tmp"
+                            else
+                                printf "%s\n" "$payload" >> "$tmp"
+                            fi
+                            inserted=1
+                        ;;
+                    esac
+                ;;
+                *)
+                    # Generic: insert just after first non-empty line
+                    case "$line" in
+                        '' ) ;; # skip empty
+                        *)
+                            if [ -n "$payload_file" ]; then
+                                cat "$payload_file" >> "$tmp"
+                            else
+                                printf "%s\n" "$payload" >> "$tmp"
+                            fi
+                            inserted=1
+                        ;;
+                    esac
+                ;;
+            esac
+        fi
+    done
+    # If we never inserted (file all includes or empty), append at bottom
+    if [ "$inserted" -eq 0 ]; then
+        if [ -n "$payload_file" ]; then
+            cat "$payload_file" >> "$tmp"
+        else
+            printf "%s\n" "$payload" >> "$tmp"
+        fi
+    fi
+    exec 3<&-
+    preview_or_commit "$tmp" "$target"
+}
+
+# Either show preview (dry-run) or move tmp to target
+preview_or_commit() {
+    tmp="$1"
+    target="$2"
+    if [ "$dryrun" -eq 1 ]; then
+        cecho "[DRY-RUN] Preview of resulting file (first 200 lines):"
+        head -n 200 "$tmp" | sed -n '1,200p'
+        rm -f "$tmp"
+    else
+        mv "$tmp" "$target" || die "Failed to write to $target"
+        vlog "Injected payload into $target (position: $position, mode: $mode)"
+        cecho "[+] Injection complete: $target"
+    fi
+}
+
+# Parse args (POSIX)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help) usage ;;
+        --about) show_about=1; about ;;
+        --signatures) show_signatures=1; signatures_list ;;
+        -v|--verbose) verbose=1 ;;
+        -q|--silent) silent=1 ;;
+        -a|--auto) auto=1 ;;
+        -s|--safe) safe=1 ;;
+        -p|--position) position="$2"; shift ;;
+        -f|--file) payload_file="$2"; shift ;;
+        -nl|--no-limitation) nolimit=1 ;;
+        -m|--mode) mode="$2"; shift ;;
+        -b|--backup) backup=1 ;;
+        -dr|--dry-run) dryrun=1 ;;
+        --log) logfile="$2"; shift ;;
+        --clean) clean=1 ;;
+        --signatures) show_signatures=1 ;;
+        --about) show_about=1 ;;
+        --help) usage ;;
+        --) shift; break ;;
+        -*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            # non-option args: payload (string) then host (file)
+            if [ -z "$payload" ] && [ -z "$payload_file" ]; then
+                payload="$1"
+            elif [ -z "$host" ]; then
+                host="$1"
+            fi
+            ;;
+    esac
+    shift
+done
+
+# If clean requested and host present -> run cleanup and exit
+if [ "$clean" -eq 1 ]; then
+    if [ -z "$host" ]; then
+        die "Please provide host file path to run --clean in that folder"
+    fi
+    do_clean
+fi
+
+# Validate host
+[ -z "$host" ] && die "No host file provided. See --help."
+[ ! -f "$host" ] && die "Host file not found: $host"
+
+# Auto mode: detect mode if not set
+if [ -z "$mode" ]; then
+    mode="$(auto_detect_mode "$host")"
+    if [ -n "$mode" ]; then
+        vlog "Auto-detected mode '$mode' from host extension"
+    fi
+fi
+
+# If payload file specified, ensure it exists
+if [ -n "$payload_file" ]; then
+    [ ! -f "$payload_file" ] && die "Payload file not found: $payload_file"
+fi
+
+# If neither payload string nor payload file set -> error
+if [ -z "$payload" ] && [ -z "$payload_file" ]; then
+    die "No payload provided. Provide a string payload or use -f payloadfile"
+fi
+
+# Size checks
+if [ -n "$payload_file" ]; then
+    if [ "$nolimit" -ne 1 ]; then
+        psize=$(wc -c < "$payload_file" 2>/dev/null || echo 0)
+        if [ "$psize" -gt "$MAX_PAYLOAD_BYTES" ]; then
+            die "Payload file too large (${psize} bytes). Use --no-limitation to override."
+        fi
+    fi
+else
+    # payload is a string variable
+    if [ "$nolimit" -ne 1 ]; then
+        psize=$(printf "%s" "$payload" | wc -c)
+        if [ "$psize" -gt "$MAX_PAYLOAD_BYTES" ]; then
+            die "Payload too large (${psize} bytes). Use --no-limitation to override."
+        fi
+    fi
+fi
+
+# Safe-mode scan
+if [ "$safe" -eq 1 ]; then
+    vlog "Safe mode: scanning payload for known signatures..."
+    if [ -n "$payload_file" ]; then
+        if detect_malware_in_file "$payload_file"; then
+            die "Safe mode blocked injection: malware signature found in payload file"
+        fi
+    else
+        if detect_malware_in_string "$payload"; then
+            die "Safe mode blocked injection: malware signature found in payload string"
+        fi
+    fi
+fi
+
+# Backup
+if [ "$backup" -eq 1 ] && [ "$dryrun" -ne 1 ]; then
+    create_backup "$host"
+fi
+
+# If auto selected, set position appropriately
+if [ "$auto" -eq 1 ]; then
+    position="after_imports"
+    vlog "Auto mode: using position 'after_imports'"
+fi
+
+# Default position
+if [ -z "$position" ]; then
+    position="bottom"
+fi
+
+vlog "Mode: ${mode:-unknown}  Position: $position  Backup: $backup  Dry-run: $dryrun"
+
+# Perform injection based on position
+case "$position" in
+    top) inject_to_top "$host" ;;
+    bottom) inject_to_bottom "$host" ;;
+    middle) inject_to_middle "$host" ;;
+    after_imports) inject_after_imports "$host" ;;
+    *)
+        die "Unknown position: $position. Use top, bottom, middle, after_imports."
+    ;;
+esac
+
+exit 0
