@@ -21,11 +21,9 @@ lightweight toolkit. Built for Termux and Linux environments.
 ## 📦 Installation
 
 ```sh
-git clone https://github.com/yourname/uniplexity.git
-cd uniplexity
+git clone https://github.com/phemoniaultramicroscopicsilica-rgb/SPI-UNIPLEXITY
 ```
 
-(Replace the URL with your actual repo once created.)
 
 ---
 
@@ -71,12 +69,7 @@ uniplexity/
 Pull requests and new ideas are welcome.  
 For major changes, open an issue first to discuss what you want to add.
 
----
 
-## 📄 License
-
-Choose one: MIT / GPL / Unlicensed / Custom.  
-(You can tell me and I’ll fill it in.)
 
 ---
 
